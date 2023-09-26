@@ -29,11 +29,14 @@ Example:
     ```
 
 """
+from contextlib import contextmanager
 import datetime
 import inspect
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Union
+import tempfile
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Protocol, Set, Union
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 import anyio
@@ -87,6 +90,17 @@ import sniffio
 from prefect.utilities.processutils import run_process
 
 __all__ = ["Runner", "serve"]
+
+
+@contextmanager
+def change_directory(destination: Path):
+    current_dir = os.getcwd()
+    try:
+        os.chdir(str(destination))
+        yield
+    finally:
+        os.chdir(current_dir)
+
 
 
 class Runner:
@@ -160,6 +174,10 @@ class Runner:
         self._deployment_ids: Set[UUID] = set()
         self._flow_run_process_map = dict()
 
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._mount_map = {}
+        self._deployment_mount_map = {}
+
     @sync_compatible
     async def add_deployment(
         self,
@@ -172,8 +190,33 @@ class Runner:
         Args:
             deployment: A deployment for the runner to register.
         """
+        mount = deployment.mount
+        if mount is not None and deployment.entrypoint is not None:
+            mount.destination = (
+                Path(self._tmp_dir.name) / mount.name
+            )
+            self._mount_map[mount.name] = {
+                "mount": mount,
+                "sync_interval": 60,
+            }
+            await mount.sync()
+
+            with change_directory(mount.destination):
+                deployment = RunnerDeployment.from_entrypoint(
+                    name=deployment.name,
+                    description=deployment.description,
+                    entrypoint=deployment.entrypoint,
+                    schedule=deployment.schedule,
+                    parameters=deployment.parameters,
+                    triggers=deployment.triggers,
+                    version=deployment.version,
+                    tags=deployment.tags,
+                    enforce_parameter_schema=deployment.enforce_parameter_schema,
+                )
+
         deployment_id = await deployment.apply()
         self._deployment_ids.add(deployment_id)
+        self._deployment_mount_map[deployment_id] = mount
 
         return deployment_id
 
@@ -298,6 +341,16 @@ class Runner:
                         jitter_range=0.3,
                     )
                 )
+                for mount in self._mount_map.values():
+                    tg.start_soon(
+                        partial(
+                            critical_service_loop,
+                            workload=mount["mount"].sync,
+                            interval=mount["sync_interval"],
+                            run_once=run_once,
+                            jitter_range=0.3,
+                        )
+                    )
 
     def stop(self):
         """Stops the runner's polling cycle."""
@@ -386,12 +439,15 @@ class Runner:
         env.update({"PREFECT__FLOW_RUN_ID": flow_run.id.hex})
         env.update(**os.environ)  # is this really necessary??
 
+        mount = self._deployment_mount_map.get(flow_run.deployment_id, None)
+
         process = await run_process(
             command.split(" "),
             stream_output=True,
             task_status=task_status,
             env=env,
             **kwargs,
+            cwd=mount.destination if mount else None,
         )
 
         # Use the pid for display if no name was given
@@ -858,6 +914,7 @@ class Runner:
     async def __aenter__(self):
         self._logger.debug("Starting runner...")
         self._client = get_client()
+        self._tmp_dir.__enter__()
         await self._client.__aenter__()
         await self._runs_task_group.__aenter__()
 
@@ -875,6 +932,7 @@ class Runner:
             await self._runs_task_group.__aexit__(*exc_info)
         if self._client:
             await self._client.__aexit__(*exc_info)
+        self._tmp_dir.__exit__(*exc_info)
 
     def __repr__(self):
         return f"Runner(name={self.name!r})"
